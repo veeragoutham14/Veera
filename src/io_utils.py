@@ -1,7 +1,7 @@
 from pathlib import Path
 import pandas as pd
 
-from src.config import CSV_GLOB, FEATURE_OUTPUT_FILENAME
+from src.config import CSV_GLOB, FEATURE_OUTPUT_FILENAME, TS_COL
 
 
 def read_varta_blm_csv(path: Path) -> pd.DataFrame:
@@ -63,3 +63,24 @@ def save_feature_table(df: pd.DataFrame, out_dir: Path) -> Path:
     df.to_csv(out_csv, index=False, sep=";", decimal=",")
     print("Saved extracted dataset to:", out_csv)
     return out_csv
+
+def load_feature_table(out_dir: Path) -> pd.DataFrame:
+    feature_path = out_dir / FEATURE_OUTPUT_FILENAME
+    if not feature_path.exists():
+        raise FileNotFoundError(
+            f"Processed feature file not found: {feature_path}\n"
+            "Run extraction first."
+        )
+
+    df = pd.read_csv(
+        feature_path,
+        sep=";",
+        decimal=",",
+    )
+
+    if TS_COL in df.columns:
+        df[TS_COL] = pd.to_datetime(df[TS_COL], errors="coerce")
+
+    print("Loaded processed feature table:", feature_path)
+    print("Shape:", df.shape)
+    return df
