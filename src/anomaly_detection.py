@@ -39,7 +39,7 @@ def run_isolation_forest(
 
     model = IsolationForest(
         n_estimators=200,
-        contamination=contamination,
+        contamination=ANOMALY_CONTAMINATION,
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )

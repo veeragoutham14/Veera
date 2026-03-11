@@ -48,6 +48,13 @@ def add_rest_flag(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_operating_mode_features(df: pd.DataFrame) -> pd.DataFrame:
+    df["is_rest"] = (df["current_abs_A"] < REST_A).astype(int)
+    df["is_charging"] = (df[CURRENT_COL] > REST_A).astype(int)
+    df["is_discharging"] = (df[CURRENT_COL] < -REST_A).astype(int)
+    return df
+
+
 def add_voltage_spread_features(df: pd.DataFrame) -> pd.DataFrame:
     if CELL_VOLT_MAX_COL in df.columns and CELL_VOLT_MIN_COL in df.columns:
         df["cell_voltage_spread_V"] = df[CELL_VOLT_MAX_COL] - df[CELL_VOLT_MIN_COL]
@@ -92,16 +99,33 @@ def add_temperature_dynamics(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_load_normalized_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Create features that relate thermal behavior to electrical load.
-    Useful to distinguish normal heating from suspicious heating.
-    """
-    eps = 1e-6
+    Create features that relate thermal/electrical imbalance to electrical load.
 
-    df["temp_spread_per_current"] = df["temp_spread_C"] / (df["current_abs_A"] + eps)
-    df["temp_mean_per_current"] = df["temp_mean_C"] / (df["current_abs_A"] + eps)
+    Important:
+    These features are only physically meaningful when current is above a
+    minimum threshold. During rest / near-zero current, they are disabled
+    to avoid artificial feature explosions.
+    """
+    load_mask = df["current_abs_A"] >= REST_A
+
+    df["temp_spread_per_current"] = np.where(
+        load_mask,
+        df["temp_spread_C"] / df["current_abs_A"],
+        np.nan,
+    )
+
+    df["temp_mean_per_current"] = np.where(
+        load_mask,
+        df["temp_mean_C"] / df["current_abs_A"],
+        np.nan,
+    )
 
     if "cell_voltage_spread_V" in df.columns:
-        df["volt_spread_per_current"] = df["cell_voltage_spread_V"] / (df["current_abs_A"] + eps)
+        df["volt_spread_per_current"] = np.where(
+            load_mask,
+            df["cell_voltage_spread_V"] / df["current_abs_A"],
+            np.nan,
+        )
 
     return df
 
@@ -119,7 +143,9 @@ def add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     df[f"T_spread_{ROLL_S}s"] = df["temp_spread_C"].rolling(win, min_periods=3).mean()
 
     if "cell_voltage_spread_V" in df.columns:
-        df[f"Vspread_mean_{ROLL_S}s"] = df["cell_voltage_spread_V"].rolling(win, min_periods=3).mean()
+        df[f"Vspread_mean_{ROLL_S}s"] = (
+            df["cell_voltage_spread_V"].rolling(win, min_periods=3).mean()
+        )
 
     df = df.reset_index()
     return df
@@ -140,6 +166,8 @@ def get_feature_columns() -> list[str]:
         "dI_dt_Aps",
         "dV_dt_Vps",
         "is_rest",
+        "is_charging",
+        "is_discharging"
 
         # Temperature statistics
         "temp_mean_C",
@@ -197,6 +225,7 @@ def build_feature_table(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     df = add_dt_feature(df)
     df = add_current_voltage_features(df)
     df = add_rest_flag(df)
+    df = add_operating_mode_features(df)
     df = add_voltage_spread_features(df)
     df = add_temperature_statistics(df)
     df = add_temperature_dynamics(df)
@@ -205,7 +234,23 @@ def build_feature_table(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
     feature_cols = [c for c in get_feature_columns() if c in df.columns]
 
-    df_feat = df.dropna(subset=feature_cols).copy()
+    # Do not drop rows just because load-normalized features are NaN during rest.
+    # Only drop rows if core features are missing.
+    core_required_cols = [
+        c for c in feature_cols
+        if c not in {
+            "temp_spread_per_current",
+            "temp_mean_per_current",
+            "volt_spread_per_current",
+        }
+    ]
+
+    df_feat = df.dropna(subset=core_required_cols).copy()
+
+    # Fill inactive load-normalized features with 0 so downstream models can use them.
+    for col in ["temp_spread_per_current", "temp_mean_per_current", "volt_spread_per_current"]:
+        if col in df_feat.columns:
+            df_feat[col] = df_feat[col].fillna(0.0)
 
     print("Rows after feature eng:", len(df_feat))
     print("Feature columns:", feature_cols)
