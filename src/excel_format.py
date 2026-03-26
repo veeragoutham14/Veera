@@ -2,14 +2,30 @@ from pathlib import Path
 import pandas as pd
 
 
-# Change these paths to match your project
 INPUT_DIR = Path(r"C:\Users\GouthamVeera\Documents\Veera\data\models")
 EXCEL_DIR = Path(r"C:\Users\GouthamVeera\Documents\Veera\data\Excel_view")
 
 
-def export_csvs_to_excel(input_dir: Path, output_dir: Path) -> None:
+def get_smallest_csv(csv_files: list[Path]) -> list[Path]:
     """
-    Convert all CSV files in input_dir to .xlsx files in output_dir.
+    Return a list containing only the smallest CSV file.
+    """
+    smallest = min(csv_files, key=lambda f: f.stat().st_size)
+    print(f"Selected smallest file: {smallest.name} ({smallest.stat().st_size / 1e6:.2f} MB)")
+    return [smallest]
+
+
+def export_csvs_to_excel(
+    input_dir: Path,
+    output_dir: Path,
+    mode: str = "all",  # "all" or "smallest"
+) -> None:
+    """
+    Convert CSV files in input_dir to Excel.
+
+    mode:
+        - "all" → export all CSVs
+        - "smallest" → export only the smallest CSV
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -21,6 +37,15 @@ def export_csvs_to_excel(input_dir: Path, output_dir: Path) -> None:
 
     print(f"Found {len(csv_files)} CSV file(s).")
 
+    # 🔥 Mode selection
+    if mode == "smallest":
+        csv_files = get_smallest_csv(csv_files)
+    elif mode == "all":
+        print("Exporting ALL files...")
+    else:
+        raise ValueError("mode must be 'all' or 'smallest'")
+
+    # 🔁 Export loop
     for csv_file in csv_files:
         try:
             df = pd.read_csv(csv_file, sep=";", decimal=",")
@@ -33,5 +58,11 @@ def export_csvs_to_excel(input_dir: Path, output_dir: Path) -> None:
     print("\nDone.")
 
 
+# 🎮 Main control
 if __name__ == "__main__":
-    export_csvs_to_excel(INPUT_DIR, EXCEL_DIR)
+    # Change this to:
+    # "all" → export everything
+    # "smallest" → export only smallest file
+    MODE = "all"
+
+    export_csvs_to_excel(INPUT_DIR, EXCEL_DIR, mode=MODE)

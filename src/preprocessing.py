@@ -8,7 +8,6 @@ from src.config import (
     SOH_COL,
     TIMESTAMP_FORMAT,
     TEMP_SENSOR_COLS,
-    GLOBAL_TEMP_FEATURES,
     VOLTAGE_SPREAD_FEATURES,
 )
 
@@ -46,7 +45,6 @@ def get_numeric_columns() -> list[str]:
     """
     numeric_cols = (
         TEMP_SENSOR_COLS
-        + GLOBAL_TEMP_FEATURES
         + VOLTAGE_SPREAD_FEATURES
         + [
             CURRENT_COL,

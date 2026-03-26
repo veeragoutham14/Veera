@@ -10,10 +10,9 @@ from src.config import (
     POWER_COL,
     CELL_VOLT_MAX_COL,
     CELL_VOLT_MIN_COL,
-    COMP_CELL_VOLT_MAX_COL,
-    COMP_CELL_VOLT_MIN_COL,
+   # COMP_CELL_VOLT_MAX_COL,
+   # COMP_CELL_VOLT_MIN_COL,
     TEMP_SENSOR_COLS,
-    GLOBAL_TEMP_FEATURES,
     REST_A,
     ROLL_S,
 )
@@ -59,10 +58,9 @@ def add_voltage_spread_features(df: pd.DataFrame) -> pd.DataFrame:
     if CELL_VOLT_MAX_COL in df.columns and CELL_VOLT_MIN_COL in df.columns:
         df["cell_voltage_spread_V"] = df[CELL_VOLT_MAX_COL] - df[CELL_VOLT_MIN_COL]
 
-    if COMP_CELL_VOLT_MAX_COL in df.columns and COMP_CELL_VOLT_MIN_COL in df.columns:
-        df["comp_cell_voltage_spread_V"] = (
-            df[COMP_CELL_VOLT_MAX_COL] - df[COMP_CELL_VOLT_MIN_COL]
-        )
+    #if COMP_CELL_VOLT_MAX_COL in df.columns and COMP_CELL_VOLT_MIN_COL in df.columns:
+        #df["comp_cell_voltage_spread_V"] = (
+            #df[COMP_CELL_VOLT_MAX_COL] - df[COMP_CELL_VOLT_MIN_COL])
 
     return df
 
@@ -196,9 +194,9 @@ def get_feature_columns() -> list[str]:
     # Optional features
     optional_cols = [
         POWER_COL,
-        "power_abs_W",
-        "cell_voltage_spread_V",
-        "comp_cell_voltage_spread_V",
+       # "power_abs_W",
+       # "cell_voltage_spread_V",
+       # "comp_cell_voltage_spread_V",
         "volt_spread_per_current",
         f"Vspread_mean_{ROLL_S}s",
     ]

@@ -15,7 +15,7 @@ from src.anomaly_detection import (
     get_top_anomalies,
     get_available_anomaly_features
 )
-from src.anomaly_explainer import explain_top_anomalies
+
 
 
 def extract() -> None:
@@ -56,47 +56,6 @@ def detect_anomalies() -> None:
     print("\nTotal samples:", len(df_scored))
     print("Detected anomalies:", len(df_anomalies_only))
 
-    print("\n--- Top 20 strongest anomalies ---")
-    cols_to_show = [
-        "timestamp",
-        "anomaly_score",
-        "temp_spread_C",
-        "temp_std_C",
-        "dT_mean_dt_Cps",
-        "dT_max_dt_Cps",
-        "cell_voltage_spread_V",
-        "current_abs_A",
-        "power_abs_W",
-    ]
-    cols_to_show = [c for c in cols_to_show if c in df_top20.columns]
-    print(df_top20[cols_to_show])
-
-    # NEW: explain top anomalies using normal rows in df_scored
-    print("\n--- Explaining top anomalies ---")
-    feature_cols = get_available_anomaly_features(df_scored)
-
-    df_explained = explain_top_anomalies(
-        df=df_scored,
-        feature_cols=feature_cols,
-        top_n=20,
-        timestamp_col="timestamp",
-        anomaly_col="anomaly",
-        score_col="anomaly_score",
-    )
-
-    cols_expl_to_show = [
-        "timestamp",
-        "anomaly_score",
-        "top_feature_1",
-        "top_feature_2",
-        "top_feature_3",
-        "explanation",
-    ]
-    cols_expl_to_show = [c for c in cols_expl_to_show if c in df_explained.columns]
-    pd.set_option("display.max_colwidth", None)
-    pd.set_option("display.max_columns", None)
-    print(df_explained[cols_expl_to_show])
-
     print("\n--- Saving anomaly outputs ---")
     save_anomaly_tables(
         df_all=df_scored,
@@ -115,8 +74,9 @@ def detect_anomalies() -> None:
 
 def main():
     #extract()
-    #visualize()
     detect_anomalies()
+    #visualize()
+    
 
 
 if __name__ == "__main__":

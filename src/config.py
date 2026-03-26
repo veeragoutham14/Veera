@@ -27,20 +27,13 @@ SOC_COL = "batteryStackProcImage-2.soc_pct"
 SOH_COL = "batteryStackProcImage-2.soh_pct"
 CURRENT_COL = "batteryStackProcImage-2.current_A"
 VOLTAGE_COL = "batteryStackProcImage-2.voltage_V"
-POWER_COL = "batteryStackProcImage-2.power_W"
-
-# Global/system temperature context
-CELL_TEMP_MAX_COL = "batteryStackProcImage-2.cellTemperatureMax_C"
-CELL_TEMP_MIN_COL = "batteryStackProcImage-2.cellTemperatureMin_C"
-PROC_TEMP_MAX_COL = "procImg.temperatureMax_C"
-PROC_TEMP_MIN_COL = "procImg.temperatureMin_C"
-
+POWER_COL = "batteryStackProcImage-2.power_W" # optional 
 
 # Voltage spread features
 CELL_VOLT_MAX_COL = "batteryStackProcImage-2.cellVoltageMax_V"
 CELL_VOLT_MIN_COL = "batteryStackProcImage-2.cellVoltageMin_V"
-COMP_CELL_VOLT_MAX_COL = "batteryStackProcImage-2.compensatedCellVoltageMax_V"
-COMP_CELL_VOLT_MIN_COL = "batteryStackProcImage-2.compensatedCellVoltageMin_V"
+# COMP_CELL_VOLT_MAX_COL = "batteryStackProcImage-2.compensatedCellVoltageMax_V" # only for soc (OCV)
+# COMP_CELL_VOLT_MIN_COL = "batteryStackProcImage-2.compensatedCellVoltageMin_V" # only for soc (OCV)
 
 # =========================
 # DETAILED PACK TEMPERATURE SENSORS
@@ -112,23 +105,17 @@ CONTEXT_FEATURES = [
     POWER_COL,
 ]
 
-GLOBAL_TEMP_FEATURES = [
-    CELL_TEMP_MAX_COL,
-    CELL_TEMP_MIN_COL,
-    PROC_TEMP_MAX_COL,
-    PROC_TEMP_MIN_COL,
-]
+
 
 VOLTAGE_SPREAD_FEATURES = [
     CELL_VOLT_MAX_COL,
     CELL_VOLT_MIN_COL,
-    COMP_CELL_VOLT_MAX_COL,
-    COMP_CELL_VOLT_MIN_COL,
+    #COMP_CELL_VOLT_MAX_COL,
+    #COMP_CELL_VOLT_MIN_COL,
 ]
 
 X_RAW = (
     CONTEXT_FEATURES
-    + GLOBAL_TEMP_FEATURES
     + VOLTAGE_SPREAD_FEATURES
     + TEMP_SENSOR_COLS
 )

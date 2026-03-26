@@ -3,16 +3,18 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
 from src.config import ANOMALY_CONTAMINATION, RANDOM_STATE
+from src.anomaly_explainer import add_anomaly_reasons
 
 ANOMALY_FEATURES = [
+    "is_rest",
+    "is_charging",
+    "is_discharging",
     "temp_spread_C",
     "temp_std_C",
     "dT_mean_dt_Cps",
     "dT_max_dt_Cps",
     "cell_voltage_spread_V",
-    "comp_cell_voltage_spread_V",
     "current_abs_A",
-    "power_abs_W",
     "volt_spread_per_current",
     "T_spread_120s",
     "Vspread_mean_120s",
@@ -47,6 +49,9 @@ def run_isolation_forest(
     df = df.copy()
     df["anomaly"] = model.fit_predict(X_scaled)          # -1 anomaly, 1 normal
     df["anomaly_score"] = model.decision_function(X_scaled)
+
+    # add explanation columns directly to returned dataframe
+    df = add_anomaly_reasons(df, feature_cols)
 
     return df
 
