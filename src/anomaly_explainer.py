@@ -1,7 +1,31 @@
 import numpy as np
 import pandas as pd
 
+from src.config import ANOMALY_FEATURES 
 
+# =========================================================
+# EXPLAINER CONFIG
+# =========================================================
+MIN_MODE_ROWS = 30
+
+# If MAD-derived scale is smaller than this, the feature is considered
+# too stable / too close to constant for reliable explanation ranking.
+MIN_EXPLAINER_SCALE = 1e-4
+
+# Clip robust z so near-zero-scale features cannot dominate everything.
+ROBUST_Z_CLIP = 10.0
+
+# Combined ranking score weights
+Z_WEIGHT = 0.7
+RELATIVE_DELTA_WEIGHT = 0.3
+
+# Prevent divide-by-zero in relative delta normalization
+RELATIVE_CENTER_FLOOR = 1e-3
+
+
+# =========================================================
+# MODE HELPERS
+# =========================================================
 def get_row_mode(row: pd.Series) -> str:
     """
     Determine battery mode from one-hot mode columns.
@@ -15,7 +39,29 @@ def get_row_mode(row: pd.Series) -> str:
     return "unknown"
 
 
-def get_mode_normal_subset(df_normal: pd.DataFrame, row: pd.Series) -> pd.DataFrame:
+def get_battery_mode_series(df: pd.DataFrame) -> pd.Series:
+    """
+    Vectorized battery mode inference from one-hot mode columns.
+    """
+    return pd.Series(
+        np.select(
+            [
+                ("is_rest" in df.columns) & (df["is_rest"] == 1),
+                ("is_charging" in df.columns) & (df["is_charging"] == 1),
+                ("is_discharging" in df.columns) & (df["is_discharging"] == 1),
+            ],
+            ["rest", "charging", "discharging"],
+            default="unknown",
+        ),
+        index=df.index,
+    )
+
+
+def get_mode_normal_subset(
+    df_normal: pd.DataFrame,
+    row: pd.Series,
+    min_rows: int = MIN_MODE_ROWS,
+) -> pd.DataFrame:
     """
     Return normal rows matching the anomaly row's mode.
     Falls back to all normal rows if mode-specific subset is too small.
@@ -31,588 +77,620 @@ def get_mode_normal_subset(df_normal: pd.DataFrame, row: pd.Series) -> pd.DataFr
     else:
         subset = df_normal
 
-    # fallback if too few rows
-    if len(subset) < 30:
+    if len(subset) < min_rows:
         return df_normal
 
     return subset
 
 
-def build_reason_text(item: dict) -> str:
-    feat = item["feature"]
-    direction = item["direction"]
-    value = item["value"]
-
-    if isinstance(value, (float, np.floating)):
-        return f"{feat} is {direction} ({value:.4f})"
-    return f"{feat} is {direction} ({value})"
-
-
-def infer_physical_interpretation(row: pd.Series, feature_summaries: list[dict]) -> str:
+def precompute_mode_baselines(
+    df_normal: pd.DataFrame,
+    feature_cols: list[str],
+    min_mode_rows: int = MIN_MODE_ROWS,
+    min_scale: float = MIN_EXPLAINER_SCALE,
+) -> dict[str, tuple[pd.Series, pd.Series]]:
     """
-    Infer a physically meaningful interpretation for one anomaly row.
-
-    Improvements:
-    - Uses only model features for anomaly families
-    - Uses SOC only as context, not as an anomaly feature
-    - Gates voltage language by raw magnitude
-    - Separates ratio anomaly from actual voltage imbalance
-    - Requires support before using transient language
-    - Combines only physically valid families
-    - Uses mode-aware wording
+    Precompute robust baselines once for all supported modes and a fallback.
     """
-    # -----------------------------
-    # Helpers
-    # -----------------------------
-    def get_value(name: str) -> float:
-        return row[name] if name in row.index else np.nan
+    fallback = compute_robust_baseline(
+        df_normal=df_normal,
+        feature_cols=feature_cols,
+        min_scale=min_scale,
+    )
+    baselines = {"fallback": fallback}
 
-    def abs_z(name: str) -> float:
-        return z_map.get(name, 0.0)
-
-    def has(name: str) -> bool:
-        return name in top_feat_set
-
-    def get_mode_label(mode: str) -> str:
-        if mode == "charging":
-            return "charging"
-        if mode == "discharging":
-            return "discharge"
-        if mode == "rest":
-            return "rest"
-        return "operation"
-
-    def get_soc_region(soc: float) -> str:
-        if pd.isna(soc):
-            return "unknown"
-        if soc < 20:
-            return "low"
-        if soc < 80:
-            return "mid"
-        return "high"
-
-    def add_soc_context(text: str, family: str) -> str:
-        """
-        Add SOC-aware wording refinement.
-        SOC is context only, not a ranking feature.
-        """
-        if soc_region == "unknown":
-            return text
-
-        if family == "voltage":
-            if soc_region == "high":
-                return text + " near high SOC, where voltage dispersion is more sensitive"
-            if soc_region == "low":
-                return text + " at low SOC, where voltage differences can be amplified"
-            return text + " in the mid-SOC range"
-
-        if family == "thermal":
-            if soc_region == "high" and mode == "charging":
-                return text + " during high-SOC charging"
-            if soc_region == "low":
-                return text + " at low SOC, where resistance-related heating may be stronger"
-            return text
-
-        if family == "transient":
-            if soc_region == "high" and mode == "charging":
-                return text + " during high-SOC charging"
-            if soc_region == "low":
-                return text + " at low SOC"
-            return text
-
-        return text
-
-    # -----------------------------
-    # Top features + z-scores
-    # -----------------------------
-    top_feat_set = set()
-    z_map: dict[str, float] = {}
-
-    for item in feature_summaries:
-        feat = item.get("feature")
-        if feat is None:
+    for mode_name, mode_col in (
+        ("rest", "is_rest"),
+        ("charging", "is_charging"),
+        ("discharging", "is_discharging"),
+    ):
+        if mode_col not in df_normal.columns:
+            baselines[mode_name] = fallback
             continue
-        top_feat_set.add(feat)
-        z = item.get("z_score", np.nan)
-        z_map[feat] = abs(z) if pd.notna(z) else 0.0
 
-    # -----------------------------
-    # Allowed model features only
-    # -----------------------------
-    temp_spread = get_value("temp_spread_C")
-    temp_std = get_value("temp_std_C")
-    dT_mean = get_value("dT_mean_dt_Cps")
-    dT_max = get_value("dT_max_dt_Cps")
-    vspread = get_value("cell_voltage_spread_V")
-    current = get_value("current_abs_A")
-    vspread_per_current = get_value("volt_spread_per_current")
-    t_spread_120s = get_value("T_spread_120s")
-    vspread_mean_120s = get_value("Vspread_mean_120s")
+        subset = df_normal[df_normal[mode_col] == 1]
+        if len(subset) < min_mode_rows:
+            baselines[mode_name] = fallback
+            continue
 
-    # -----------------------------
-    # Context
-    # -----------------------------
-    mode = row["battery_mode"] if "battery_mode" in row.index else "unknown"
-    mode_label = get_mode_label(mode)
-
-    # IMPORTANT:
-    # Replace "soc_pct" with your real SOC column if needed.
-    # Example:
-    # soc = get_value("batteryStackProcImage-2.soc_pct")
-    soc = get_value("batteryStackProcImage-2.soc_pct")
-    soc_region = get_soc_region(soc)
-
-    # -----------------------------
-    # Magnitude gates
-    # -----------------------------
-    low_current = pd.notna(current) and current < 3.0
-    high_current = pd.notna(current) and current >= 10.0
-
-    # Voltage: raw magnitude
-    voltage_spread_elevated = pd.notna(vspread) and vspread >= 0.015
-    voltage_spread_high = pd.notna(vspread) and vspread >= 0.025
-    voltage_spread_weak = pd.isna(vspread) or vspread < 0.010
-
-    # Voltage persistence
-    voltage_persistent = pd.notna(vspread_mean_120s) and vspread_mean_120s >= 0.015
-    voltage_not_persistent = pd.notna(vspread_mean_120s) and vspread_mean_120s < 0.008
-    voltage_persistence_weak = pd.isna(vspread_mean_120s) or vspread_mean_120s < 0.010
-
-    # Ratio-based voltage anomaly
-    ratio_voltage_high = pd.notna(vspread_per_current) and vspread_per_current >= 0.008
-    ratio_voltage_moderate = pd.notna(vspread_per_current) and vspread_per_current >= 0.005
-
-    # Thermal
-    temp_spread_elevated = pd.notna(temp_spread) and temp_spread >= 2.0
-    temp_spread_high = pd.notna(temp_spread) and temp_spread >= 2.8
-    temp_std_elevated = pd.notna(temp_std) and temp_std >= 0.60
-
-    thermal_persistent = pd.notna(t_spread_120s) and t_spread_120s >= 2.2
-    thermal_strongly_persistent = pd.notna(t_spread_120s) and t_spread_120s >= 2.7
-
-    # -----------------------------
-    # Physically valid family flags
-    # -----------------------------
-    # True voltage imbalance requires raw spread support
-    valid_voltage_imbalance = voltage_spread_elevated
-    valid_sustained_voltage = voltage_spread_elevated and voltage_persistent
-
-    # Ratio anomaly only: high ratio, low current, but no actual strong raw voltage spread
-    valid_ratio_voltage = (
-        ratio_voltage_high
-        and low_current
-        and not valid_voltage_imbalance
-        and voltage_persistence_weak
-    )
-
-    # Thermal imbalance
-    valid_thermal_imbalance = temp_spread_elevated or temp_std_elevated
-    valid_sustained_thermal = thermal_persistent and valid_thermal_imbalance
-    valid_strong_thermal = thermal_strongly_persistent and (temp_spread_high or temp_std_elevated)
-
-    # Supported transient
-    derivative_pair_strong = (
-        pd.notna(dT_max) and abs(dT_max) >= 0.08 and
-        pd.notna(dT_mean) and abs(dT_mean) >= 0.005
-    )
-
-    derivative_single_very_strong = (
-        (pd.notna(dT_max) and abs(dT_max) >= 0.10) or
-        (pd.notna(dT_mean) and abs(dT_mean) >= 0.008)
-    )
-
-    transient_supported = (
-        derivative_pair_strong or
-        (
-            derivative_single_very_strong and
-            (high_current or valid_thermal_imbalance or thermal_persistent)
+        baselines[mode_name] = compute_robust_baseline(
+            df_normal=subset,
+            feature_cols=feature_cols,
+            min_scale=min_scale,
         )
-    )
 
-    transient_strong = (
-        derivative_pair_strong and
-        (high_current or valid_sustained_thermal or valid_sustained_voltage)
-    )
+    baselines["unknown"] = fallback
+    return baselines
 
-    # -----------------------------
-    # Pattern strength scores
-    # Only reward physically supported patterns
-    # -----------------------------
-    voltage_score = 0.0
-    thermal_score = 0.0
-    transient_score = 0.0
-    load_context_score = 0.0
 
-    # Voltage family
-    if valid_sustained_voltage:
-        voltage_score += 3.0
-    elif valid_voltage_imbalance:
-        voltage_score += 2.2
-    elif valid_ratio_voltage:
-        voltage_score += 1.6
-    elif ratio_voltage_moderate and low_current and has("volt_spread_per_current"):
-        voltage_score += 0.8
+def get_baseline_for_mode(
+    mode: str,
+    mode_baselines: dict[str, tuple[pd.Series, pd.Series]],
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Return the precomputed baseline for a mode or the shared fallback.
+    """
+    return mode_baselines.get(mode, mode_baselines["fallback"])
 
-    if has("cell_voltage_spread_V") and valid_voltage_imbalance:
-        voltage_score += 0.25 * abs_z("cell_voltage_spread_V")
-    if has("Vspread_mean_120s") and voltage_persistent:
-        voltage_score += 0.20 * abs_z("Vspread_mean_120s")
-    if has("volt_spread_per_current") and (valid_ratio_voltage or valid_voltage_imbalance):
-        voltage_score += 0.20 * abs_z("volt_spread_per_current")
 
-    # Thermal family
-    if valid_strong_thermal:
-        thermal_score += 3.0
-    elif valid_sustained_thermal:
-        thermal_score += 2.5
-    elif valid_thermal_imbalance:
-        thermal_score += 1.8
-    elif thermal_persistent:
-        thermal_score += 1.2
+# =========================================================
+# ROBUST STATISTICS
+# =========================================================
+def _robust_center(x: pd.Series) -> float:
+    return float(x.median())
 
-    if has("temp_spread_C") and temp_spread_elevated:
-        thermal_score += 0.25 * abs_z("temp_spread_C")
-    if has("temp_std_C") and temp_std_elevated:
-        thermal_score += 0.20 * abs_z("temp_std_C")
-    if has("T_spread_120s") and thermal_persistent:
-        thermal_score += 0.20 * abs_z("T_spread_120s")
 
-    # Transient family
-    if transient_strong:
-        transient_score += 3.0
-    elif transient_supported:
-        transient_score += 2.0
-    elif has("dT_max_dt_Cps") or has("dT_mean_dt_Cps"):
-        transient_score += 0.8
+def _robust_mad(x: pd.Series) -> float:
+    """
+    Median absolute deviation.
+    """
+    med = x.median()
+    mad = np.median(np.abs(x - med))
+    return float(mad)
 
-    if has("dT_max_dt_Cps"):
-        transient_score += 0.25 * abs_z("dT_max_dt_Cps")
-    if has("dT_mean_dt_Cps"):
-        transient_score += 0.20 * abs_z("dT_mean_dt_Cps")
 
-    # Load context family
-    if has("current_abs_A"):
-        load_context_score += 0.20 * abs_z("current_abs_A")
-    if low_current or high_current:
-        load_context_score += 0.5
+def _robust_scale_from_mad(
+    x: pd.Series,
+    min_scale: float = MIN_EXPLAINER_SCALE,
+) -> float:
+    """
+    Convert MAD to a robust sigma estimate.
+    1.4826 * MAD approximates std for Gaussian data.
 
-    # -----------------------------
-    # Determine dominant families
-    # -----------------------------
-    family_scores = {
-        "voltage": voltage_score,
-        "thermal": thermal_score,
-        "transient": transient_score,
-        "load": load_context_score,
+    If the scale is too small, return NaN so the feature is ignored
+    in explanation ranking rather than exploding numerically.
+    """
+    mad = _robust_mad(x)
+    scale = 1.4826 * mad
+
+    if scale < min_scale:
+        return np.nan
+
+    return float(scale)
+
+
+def compute_robust_baseline(
+    df_normal: pd.DataFrame,
+    feature_cols: list[str],
+    min_scale: float = MIN_EXPLAINER_SCALE,
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Compute robust center and robust scale for each feature.
+    """
+    centers = {}
+    scales = {}
+
+    for feat in feature_cols:
+        s = pd.to_numeric(df_normal[feat], errors="coerce").dropna()
+
+        if s.empty:
+            centers[feat] = np.nan
+            scales[feat] = np.nan
+            continue
+
+        centers[feat] = _robust_center(s)
+        scales[feat] = _robust_scale_from_mad(s, min_scale=min_scale)
+
+    return pd.Series(centers), pd.Series(scales)
+
+
+def clip_robust_z(z: pd.Series, clip_value: float = ROBUST_Z_CLIP) -> pd.Series:
+    """
+    Clip robust z-scores so near-zero-scale artifacts do not dominate.
+    """
+    return z.clip(lower=-clip_value, upper=clip_value)
+
+
+def compute_relative_delta_score(
+    delta: float,
+    center: float,
+    floor: float = RELATIVE_CENTER_FLOOR,
+) -> float:
+    """
+    Compute a unitless relative deviation score.
+
+    This complements robust z by rewarding physically meaningful shifts,
+    especially when a feature's center is far from zero.
+    """
+    if pd.isna(delta) or pd.isna(center):
+        return np.nan
+
+    denom = max(abs(float(center)), floor)
+    return abs(float(delta)) / denom
+
+
+def compute_ranking_score(
+    robust_z_clipped: float,
+    relative_delta_score: float,
+    z_weight: float = Z_WEIGHT,
+    relative_delta_weight: float = RELATIVE_DELTA_WEIGHT,
+) -> float:
+    """
+    Combine clipped robust z and relative delta into one explanation ranking score.
+    """
+    z_part = 0.0 if pd.isna(robust_z_clipped) else abs(float(robust_z_clipped))
+    d_part = 0.0 if pd.isna(relative_delta_score) else float(relative_delta_score)
+    return z_weight * z_part + relative_delta_weight * d_part
+
+
+# =========================================================
+# FEATURE FAMILY HELPERS
+# =========================================================
+def get_feature_families() -> dict[str, set[str]]:
+    return {
+        "pack_imbalance": {
+            "pack_temp_spread_C",
+            "pack_temp_std_C",
+            "pack_max_dev_from_median_C",
+            "max_intra_module_pack_delta_C",
+        },
+        "internal_pack_nonuniformity": {
+            "max_pack_internal_spread_C",
+            "mean_pack_internal_spread_C",
+            "max_pack_internal_std_C",
+            "mean_pack_internal_std_C",
+            "max_pack_hotspot_delta_C",
+            "mean_pack_hotspot_delta_C",
+        },
+        "persistent_thermal_imbalance": {
+            "pack_temp_spread_mean_120s",
+            "pack_temp_std_mean_120s",
+            "pack_max_dev_from_median_mean_120s",
+            "max_intra_module_pack_delta_mean_120s",
+        },
+        "electrical_imbalance": {
+            "cell_voltage_spread_V",
+            "Vspread_mean_120s",
+        },
     }
 
-    sorted_families = sorted(family_scores.items(), key=lambda x: x[1], reverse=True)
-    primary_family, primary_score = sorted_families[0]
-    secondary_family, secondary_score = sorted_families[1]
 
-    secondary_relevant = secondary_score >= max(1.5, 0.65 * primary_score)
+def family_of_feature(feature: str) -> str:
+    families = get_feature_families()
+    for family_name, feats in families.items():
+        if feature in feats:
+            return family_name
+    return "other"
 
-    # -----------------------------
-    # Build primary phrase
-    # -----------------------------
-    primary_phrase = None
-    secondary_phrase = None
 
-    if primary_family == "voltage":
-        if valid_sustained_voltage:
-            if low_current:
-                primary_phrase = f"sustained cell voltage imbalance is present even under low-current {mode_label}"
-            else:
-                primary_phrase = "sustained cell voltage imbalance is the dominant anomaly pattern"
-        elif valid_voltage_imbalance:
-            if low_current:
-                primary_phrase = f"cell voltage spread is unusually high relative to the low current {mode_label}"
-            else:
-                primary_phrase = f"cell voltage spread is elevated during {mode_label}"
-        elif valid_ratio_voltage:
-            primary_phrase = f"a relative voltage anomaly appears unusually strong for this low-current {mode_label} condition"
+def aggregate_family_scores(feature_summaries: list[dict]) -> dict[str, float]:
+    """
+    Aggregate explanation score by family.
+    Uses ranking_score if available, otherwise falls back to abs(robust_z).
+    """
+    scores = {k: 0.0 for k in get_feature_families().keys()}
+    scores["other"] = 0.0
+
+    for item in feature_summaries:
+        feat = item["feature"]
+
+        if "ranking_score" in item and pd.notna(item["ranking_score"]):
+            score_value = float(item["ranking_score"])
         else:
-            primary_phrase = "voltage-related behaviour deviates from the mode-specific baseline"
+            z = item["robust_z"]
+            if pd.isna(z):
+                continue
+            score_value = abs(float(z))
 
-    elif primary_family == "thermal":
-        if valid_strong_thermal:
-            primary_phrase = "sustained thermal imbalance across the battery pack is strongly indicated"
-        elif valid_sustained_thermal:
-            primary_phrase = "sustained thermal imbalance across the battery pack is observed"
-        elif valid_thermal_imbalance:
-            primary_phrase = "thermal non-uniformity is observed across the battery pack"
-        elif thermal_persistent:
-            primary_phrase = "temperature spread over time is elevated"
-        else:
-            primary_phrase = "thermal behaviour deviates from the mode-specific baseline"
+        fam = family_of_feature(feat)
+        scores[fam] += score_value
 
-    elif primary_family == "transient":
-        if transient_strong and high_current:
-            primary_phrase = f"a strong transient thermal response is observed under high {mode_label} load"
-        elif transient_strong:
-            primary_phrase = "temperature dynamics indicate a strong unusual transient response"
-        elif transient_supported:
-            primary_phrase = "temperature dynamics indicate an unusual transient response"
-        else:
-            primary_phrase = f"temperature-rate features deviate from the normal {mode_label} baseline"
+    return scores
 
+
+# =========================================================
+# DIAGNOSTIC LOCALIZATION
+# =========================================================
+def extract_pack_diagnostics(row: pd.Series) -> dict[str, object]:
+    """
+    Optional diagnostic localization from engineered per-pack columns.
+    This does NOT affect anomaly scoring.
+    """
+    diagnostics: dict[str, object] = {
+        "worst_pack_by_internal_spread": None,
+        "worst_pack_internal_spread_C": np.nan,
+        "worst_pack_by_internal_std": None,
+        "worst_pack_internal_std_C": np.nan,
+        "worst_pack_by_hotspot_delta": None,
+        "worst_pack_hotspot_delta_C": np.nan,
+        "hottest_pack_by_mean": None,
+        "hottest_pack_temp_mean_C": np.nan,
+        "coldest_pack_by_mean": None,
+        "coldest_pack_temp_mean_C": np.nan,
+    }
+
+    spread_candidates = {}
+    std_candidates = {}
+    hotspot_candidates = {}
+    mean_candidates = {}
+
+    for col in row.index:
+        if col.endswith("_temp_spread_C") and col.startswith("mod"):
+            spread_candidates[col.replace("_temp_spread_C", "")] = row[col]
+        elif col.endswith("_temp_std_C") and col.startswith("mod"):
+            std_candidates[col.replace("_temp_std_C", "")] = row[col]
+        elif col.endswith("_hotspot_delta_C") and col.startswith("mod"):
+            hotspot_candidates[col.replace("_hotspot_delta_C", "")] = row[col]
+        elif col.endswith("_temp_mean_C") and col.startswith("mod"):
+            mean_candidates[col.replace("_temp_mean_C", "")] = row[col]
+
+    if spread_candidates:
+        worst_pack = max(spread_candidates, key=spread_candidates.get)
+        diagnostics["worst_pack_by_internal_spread"] = worst_pack
+        diagnostics["worst_pack_internal_spread_C"] = spread_candidates[worst_pack]
+
+    if std_candidates:
+        worst_pack = max(std_candidates, key=std_candidates.get)
+        diagnostics["worst_pack_by_internal_std"] = worst_pack
+        diagnostics["worst_pack_internal_std_C"] = std_candidates[worst_pack]
+
+    if hotspot_candidates:
+        worst_pack = max(hotspot_candidates, key=hotspot_candidates.get)
+        diagnostics["worst_pack_by_hotspot_delta"] = worst_pack
+        diagnostics["worst_pack_hotspot_delta_C"] = hotspot_candidates[worst_pack]
+
+    if mean_candidates:
+        hottest_pack = max(mean_candidates, key=mean_candidates.get)
+        coldest_pack = min(mean_candidates, key=mean_candidates.get)
+        diagnostics["hottest_pack_by_mean"] = hottest_pack
+        diagnostics["hottest_pack_temp_mean_C"] = mean_candidates[hottest_pack]
+        diagnostics["coldest_pack_by_mean"] = coldest_pack
+        diagnostics["coldest_pack_temp_mean_C"] = mean_candidates[coldest_pack]
+
+    return diagnostics
+
+
+# =========================================================
+# EXPLANATION TEXT HELPERS
+# =========================================================
+def build_reason_text(item: dict) -> str:
+    feat = item["feature"]
+    value = item["value"]
+    center = item["normal_center"]
+    delta = item["delta"]
+    rz = item["robust_z"]
+    rz_clipped = item.get("robust_z_clipped", np.nan)
+    rel_delta = item.get("relative_delta_score", np.nan)
+    ranking_score = item.get("ranking_score", np.nan)
+    direction = item["direction"]
+
+    def fmt(x: float) -> str:
+        return f"{x:.4f}" if pd.notna(x) else "nan"
+
+    return (
+        f"{feat} is {direction}: "
+        f"value={fmt(value)}, "
+        f"normal_center={fmt(center)}, "
+        f"delta={fmt(delta)}, "
+        f"robust_z={fmt(rz)}, "
+        f"robust_z_clipped={fmt(rz_clipped)}, "
+        f"relative_delta_score={fmt(rel_delta)}, "
+        f"ranking_score={fmt(ranking_score)}"
+    )
+
+
+def infer_physical_interpretation(
+    row: pd.Series,
+    feature_summaries: list[dict],
+    family_scores: dict[str, float],
+    diagnostics: dict[str, object] | None = None,
+) -> str:
+    """
+    Turn robust feature deviations into a physically meaningful explanation.
+    """
+    if not feature_summaries:
+        return "no robust deviation explanation available"
+
+    mode = get_row_mode(row)
+    ranked = sorted(family_scores.items(), key=lambda x: x[1], reverse=True)
+    primary_family, primary_score = ranked[0]
+    secondary_family, secondary_score = ranked[1]
+
+    secondary_relevant = secondary_score >= max(1.5, 0.6 * primary_score)
+
+    feature_set = {item["feature"] for item in feature_summaries}
+
+    def has(feat: str) -> bool:
+        return feat in feature_set
+
+    if primary_family == "pack_imbalance":
+        text = f"anomaly is mainly driven by pack-to-pack thermal imbalance during {mode} operation"
+    elif primary_family == "internal_pack_nonuniformity":
+        text = f"anomaly is mainly driven by unusually uneven temperature distribution inside one or more packs during {mode} operation"
+    elif primary_family == "persistent_thermal_imbalance":
+        text = f"anomaly is mainly driven by thermal imbalance that persists over time during {mode} operation"
+    elif primary_family == "electrical_imbalance":
+        text = f"anomaly is mainly driven by cell-voltage imbalance during {mode} operation"
     else:
-        if low_current:
-            primary_phrase = f"the anomaly occurs under unusually low-current {mode_label}"
-        elif high_current:
-            primary_phrase = f"the anomaly occurs under unusually high-current {mode_label}"
-        else:
-            primary_phrase = f"the current level appears inconsistent with normal {mode_label} behaviour"
+        text = f"anomaly is driven by a mixed deviation pattern during {mode} operation"
 
-    primary_phrase = add_soc_context(primary_phrase, primary_family)
+    if primary_family == "electrical_imbalance":
+        if has("cell_voltage_spread_V") and has("Vspread_mean_120s"):
+            text = f"anomaly is mainly driven by sustained cell-voltage imbalance during {mode} operation"
+        elif has("cell_voltage_spread_V"):
+            text = f"anomaly is mainly driven by instantaneous cell-voltage spread during {mode} operation"
 
-    # -----------------------------
-    # Secondary phrase
-    # Only combine if physically valid
-    # -----------------------------
+    if primary_family == "persistent_thermal_imbalance":
+        if has("pack_temp_spread_mean_120s") or has("pack_max_dev_from_median_mean_120s"):
+            text = f"anomaly is mainly driven by persistent pack-level thermal separation during {mode} operation"
+
+    if primary_family == "internal_pack_nonuniformity" and diagnostics:
+        culprit = diagnostics.get("worst_pack_by_internal_spread")
+        if culprit:
+            text += f"; strongest internal spread is observed in {culprit}"
+
+    if primary_family == "pack_imbalance" and diagnostics:
+        hot = diagnostics.get("hottest_pack_by_mean")
+        cold = diagnostics.get("coldest_pack_by_mean")
+        if hot and cold:
+            text += f"; hottest pack is {hot} and coldest pack is {cold}"
+
     if secondary_relevant:
-        if secondary_family == "voltage":
-            if valid_sustained_voltage:
-                secondary_phrase = "concurrent sustained cell voltage imbalance is also present"
-            elif valid_voltage_imbalance:
-                secondary_phrase = "concurrent cell voltage spread is also elevated"
-            elif valid_ratio_voltage:
-                secondary_phrase = f"concurrent relative voltage anomaly is also present under low-current {mode_label}"
+        secondary_text = None
+        if secondary_family == "pack_imbalance":
+            secondary_text = "pack-to-pack imbalance is also elevated"
+        elif secondary_family == "internal_pack_nonuniformity":
+            secondary_text = "internal pack non-uniformity is also elevated"
+        elif secondary_family == "persistent_thermal_imbalance":
+            secondary_text = "the deviation is also persistent over time"
+        elif secondary_family == "electrical_imbalance":
+            secondary_text = "electrical imbalance is also elevated"
 
-        elif secondary_family == "thermal":
-            if valid_strong_thermal:
-                secondary_phrase = "concurrent strong sustained thermal imbalance is also present"
-            elif valid_sustained_thermal:
-                secondary_phrase = "concurrent sustained thermal imbalance is also present"
-            elif valid_thermal_imbalance:
-                secondary_phrase = "concurrent thermal non-uniformity is also present"
+        if secondary_text:
+            text += f"; {secondary_text}"
 
-        elif secondary_family == "transient":
-            if transient_strong:
-                secondary_phrase = "concurrent strong transient behaviour is also visible"
-            elif transient_supported:
-                secondary_phrase = "concurrent transient behaviour is also visible"
+    return text
 
-        elif secondary_family == "load":
-            if low_current:
-                secondary_phrase = f"the event also occurs under low-current {mode_label}"
-            elif high_current:
-                secondary_phrase = f"the event also occurs under high-current {mode_label}"
 
-    # -----------------------------
-    # Special-case mixed patterns
-    # -----------------------------
-    # Voltage + transient
-    if primary_family == "voltage" and secondary_relevant and secondary_family == "transient":
-        if valid_sustained_voltage and transient_supported:
-            return add_soc_context(
-                "sustained cell voltage imbalance is present, with concurrent unusual transient thermal behaviour",
-                "voltage",
-            )
-        if valid_voltage_imbalance and transient_supported:
-            return add_soc_context(
-                "cell voltage imbalance is present, with concurrent unusual transient thermal behaviour",
-                "voltage",
-            )
-        if valid_ratio_voltage and transient_supported:
-            return add_soc_context(
-                f"a relative voltage anomaly is present, with concurrent unusual transient thermal behaviour during {mode_label}",
-                "voltage",
-            )
-
-    if primary_family == "transient" and secondary_relevant and secondary_family == "voltage":
-        if valid_sustained_voltage and transient_supported:
-            if transient_strong and high_current:
-                return add_soc_context(
-                    f"a strong transient thermal response is observed under high {mode_label} load, with concurrent sustained cell voltage imbalance",
-                    "transient",
-                )
-            return add_soc_context(
-                "an unusual transient thermal response is dominant, with concurrent sustained cell voltage imbalance",
-                "transient",
-            )
-
-        if valid_voltage_imbalance and transient_supported:
-            if transient_strong and high_current:
-                return add_soc_context(
-                    f"a strong transient thermal response is observed under high {mode_label} load, with concurrent voltage imbalance",
-                    "transient",
-                )
-            return add_soc_context(
-                "an unusual transient thermal response is dominant, with concurrent voltage imbalance",
-                "transient",
-            )
-
-        # If voltage is not physically valid, do not mention it
-        if transient_strong and high_current:
-            return add_soc_context(
-                f"a strong transient thermal response is observed under high {mode_label} load",
-                "transient",
-            )
-        if transient_supported:
-            return add_soc_context(
-                "temperature dynamics indicate an unusual transient response",
-                "transient",
-            )
-
-    # Thermal + transient
-    if primary_family == "thermal" and secondary_relevant and secondary_family == "transient":
-        if valid_sustained_thermal and transient_supported:
-            return add_soc_context(
-                "sustained thermal imbalance is dominant, with concurrent unusual transient behaviour",
-                "thermal",
-            )
-        if valid_thermal_imbalance and transient_supported:
-            return add_soc_context(
-                "thermal non-uniformity is dominant, with concurrent unusual transient behaviour",
-                "thermal",
-            )
-
-    if primary_family == "transient" and secondary_relevant and secondary_family == "thermal":
-        if valid_sustained_thermal and transient_supported:
-            return add_soc_context(
-                "an unusual transient thermal response is dominant, with concurrent sustained thermal imbalance",
-                "transient",
-            )
-        if valid_thermal_imbalance and transient_supported:
-            return add_soc_context(
-                "an unusual transient thermal response is dominant, with concurrent thermal non-uniformity",
-                "transient",
-            )
-
-    # Voltage + thermal
-    if primary_family == "voltage" and secondary_relevant and secondary_family == "thermal":
-        if valid_sustained_voltage and valid_sustained_thermal:
-            return add_soc_context(
-                "sustained cell voltage imbalance is dominant, with concurrent sustained thermal imbalance",
-                "voltage",
-            )
-        if valid_voltage_imbalance and valid_thermal_imbalance:
-            return add_soc_context(
-                "voltage imbalance is dominant, with concurrent thermal non-uniformity",
-                "voltage",
-            )
-        if valid_ratio_voltage and valid_thermal_imbalance:
-            return add_soc_context(
-                f"relative voltage anomaly is present under low-current {mode_label}, with concurrent thermal non-uniformity",
-                "voltage",
-            )
-
-    if primary_family == "thermal" and secondary_relevant and secondary_family == "voltage":
-        if valid_sustained_thermal and valid_sustained_voltage:
-            return add_soc_context(
-                "sustained thermal imbalance is dominant, with concurrent sustained cell voltage imbalance",
-                "thermal",
-            )
-        if valid_thermal_imbalance and valid_voltage_imbalance:
-            return add_soc_context(
-                "thermal non-uniformity is dominant, with concurrent voltage imbalance",
-                "thermal",
-            )
-        # weak ratio-only voltage evidence is intentionally ignored here
-
-    # -----------------------------
-    # General composition
-    # -----------------------------
-    if primary_phrase and secondary_phrase:
-        return f"{primary_phrase}, and {secondary_phrase}"
-
-    if primary_phrase:
-        return primary_phrase
-
-    return "multiple features jointly deviate from normal operating behaviour"
-
+# =========================================================
+# MAIN EXPLAINER
+# =========================================================
+    
 
 def add_anomaly_reasons(
     df: pd.DataFrame,
     feature_cols: list[str],
     anomaly_col: str = "anomaly",
+    top_k: int = 4,
+    min_mode_rows: int = MIN_MODE_ROWS,
+    add_diagnostics: bool = True,
+    baseline_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Add explanation columns directly to the main dataframe.
 
-    For each anomaly row:
-    - select normal rows from the same battery mode
-    - compute mode-specific mean/std
-    - find top 3 deviating features
-    - store reasons in new columns
+    Uses:
+    - mode-aware baseline
+    - robust z-score (median / MAD)
+    - clipped robust z
+    - combined ranking score
+    - family aggregation
+    - top-feature detail
+    - optional pack diagnostics
 
-    Falls back to global normal rows if too few normal rows exist for that mode.
+    IMPORTANT:
+    Explanation scores are computed ONLY from the supplied feature_cols.
     """
     df = df.copy()
+    baseline_source = df if baseline_df is None else baseline_df.copy()
 
     usable_features = [c for c in feature_cols if c in df.columns]
     if not usable_features:
         raise ValueError("No usable feature columns found for explanation.")
 
-    df_normal = df[df[anomaly_col] == 1].copy()
+    df_normal = baseline_source[baseline_source[anomaly_col] == 1].copy()
     if df_normal.empty:
         raise ValueError("No normal rows found. Cannot build baseline statistics.")
 
-    # initialize empty columns
-    df["battery_mode"] = df.apply(get_row_mode, axis=1)
+    df["battery_mode"] = get_battery_mode_series(df)
+    if "battery_mode" not in baseline_source.columns:
+        baseline_source["battery_mode"] = get_battery_mode_series(baseline_source)
+    df_normal["battery_mode"] = baseline_source.loc[df_normal.index, "battery_mode"]
+    mode_baselines = precompute_mode_baselines(
+        df_normal=df_normal,
+        feature_cols=usable_features,
+        min_mode_rows=min_mode_rows,
+        min_scale=MIN_EXPLAINER_SCALE,
+    )
 
-    df["top_feature_1"] = None
-    df["top_feature_2"] = None
-    df["top_feature_3"] = None
+    # Top-feature explanation columns
+    for i in range(1, top_k + 1):
+        df[f"top_feature_{i}"] = None
+        df[f"top_anomaly_reason_{i}"] = None
+        df[f"top_feature_{i}_robust_z"] = np.nan
+        df[f"top_feature_{i}_robust_z_clipped"] = np.nan
+        df[f"top_feature_{i}_delta"] = np.nan
+        df[f"top_feature_{i}_relative_delta_score"] = np.nan
+        df[f"top_feature_{i}_ranking_score"] = np.nan
+        df[f"top_feature_{i}_normal_center"] = np.nan
+        df[f"top_feature_{i}_family"] = None
 
-    df["top anomaly reason 1"] = None
-    df["top anomaly reason 2"] = None
-    df["top anomaly reason 3"] = None
+    # Family score columns
+    for fam in get_feature_families().keys():
+        df[f"family_score_{fam}"] = np.nan
 
     df["interpretation"] = None
 
+    # Optional diagnostics
+    text_diagnostic_cols = [
+        "worst_pack_by_internal_spread",
+        "worst_pack_by_internal_std",
+        "worst_pack_by_hotspot_delta",
+        "hottest_pack_by_mean",
+        "coldest_pack_by_mean",
+    ]
+
+    numeric_diagnostic_cols = [
+        "worst_pack_internal_spread_C",
+        "worst_pack_internal_std_C",
+        "worst_pack_hotspot_delta_C",
+        "hottest_pack_temp_mean_C",
+        "coldest_pack_temp_mean_C",
+    ]
+
+    if add_diagnostics:
+        for col in text_diagnostic_cols:
+            df[col] = None
+
+        for col in numeric_diagnostic_cols:
+            df[col] = np.nan
+
     anomaly_indices = df.index[df[anomaly_col] == -1]
+    if len(anomaly_indices) == 0:
+        if add_diagnostics:
+            for col in numeric_diagnostic_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
 
     for idx in anomaly_indices:
         row = df.loc[idx]
 
-        # mode-aware normal baseline
-        df_mode_normal = get_mode_normal_subset(df_normal, row)
-
-        normal_mean = df_mode_normal[usable_features].mean()
-        normal_std = df_mode_normal[usable_features].std().replace(0, np.nan)
-
-        deviations = ((row[usable_features] - normal_mean) / normal_std).replace(
-            [np.inf, -np.inf], np.nan
+        # -------------------------
+        # Robust baseline
+        # -------------------------
+        normal_center, robust_scale = get_baseline_for_mode(
+            mode=row["battery_mode"],
+            mode_baselines=mode_baselines,
         )
 
-        abs_dev = deviations.abs().sort_values(ascending=False)
-        top3 = abs_dev.head(3).index.tolist()
+        robust_z = ((row[usable_features] - normal_center) / robust_scale).replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+
+        robust_z_clipped = clip_robust_z(robust_z, clip_value=ROBUST_Z_CLIP)
+        deltas = row[usable_features] - normal_center
+
+        ranking_items = []
+        for feat in usable_features:
+            value = row[feat]
+            center = normal_center[feat]
+            delta = deltas[feat]
+            rz = robust_z[feat]
+            rz_clipped = robust_z_clipped[feat]
+
+            if pd.isna(rz_clipped):
+                continue
+
+            rel_delta_score = compute_relative_delta_score(delta=delta, center=center)
+            ranking_score = compute_ranking_score(
+                robust_z_clipped=rz_clipped,
+                relative_delta_score=rel_delta_score,
+            )
+
+            ranking_items.append(
+                {
+                    "feature": feat,
+                    "value": value,
+                    "normal_center": center,
+                    "delta": delta,
+                    "robust_z": rz,
+                    "robust_z_clipped": rz_clipped,
+                    "relative_delta_score": rel_delta_score,
+                    "ranking_score": ranking_score,
+                }
+            )
+
+        ranking_items.sort(
+            key=lambda item: (-np.inf if pd.isna(item["ranking_score"]) else item["ranking_score"]),
+            reverse=True,
+        )
+        ranking_items = ranking_items[:top_k]
 
         feature_summaries = []
-        for feat in top3:
-            value = row[feat]
-            z = deviations[feat]
+        for item in ranking_items:
+            rz = item["robust_z_clipped"]
 
-            if pd.isna(z):
+            if pd.isna(rz):
                 direction = "unusual"
-            elif z > 0:
+            elif rz > 0:
                 direction = "high"
             else:
                 direction = "low"
 
             feature_summaries.append(
                 {
-                    "feature": feat,
-                    "value": value,
-                    "z_score": z,
+                    "feature": item["feature"],
+                    "value": item["value"],
+                    "normal_center": item["normal_center"],
+                    "delta": item["delta"],
+                    "robust_z": item["robust_z"],
+                    "robust_z_clipped": item["robust_z_clipped"],
+                    "relative_delta_score": item["relative_delta_score"],
+                    "ranking_score": item["ranking_score"],
                     "direction": direction,
+                    "family": family_of_feature(item["feature"]),
                 }
             )
 
-        if len(feature_summaries) > 0:
-            df.at[idx, "top_feature_1"] = feature_summaries[0]["feature"]
-            df.at[idx, "top anomaly reason 1"] = build_reason_text(feature_summaries[0])
+        # -------------------------
+        # Family aggregation
+        # -------------------------
+        family_scores = aggregate_family_scores(feature_summaries)
 
-        if len(feature_summaries) > 1:
-            df.at[idx, "top_feature_2"] = feature_summaries[1]["feature"]
-            df.at[idx, "top anomaly reason 2"] = build_reason_text(feature_summaries[1])
+        for fam, score in family_scores.items():
+            col = f"family_score_{fam}"
+            if col in df.columns:
+                df.at[idx, col] = score
 
-        if len(feature_summaries) > 2:
-            df.at[idx, "top_feature_3"] = feature_summaries[2]["feature"]
-            df.at[idx, "top anomaly reason 3"] = build_reason_text(feature_summaries[2])
+        # -------------------------
+        # Diagnostics
+        # -------------------------
+        diagnostics = extract_pack_diagnostics(row) if add_diagnostics else None
+        if diagnostics:
+            for k, v in diagnostics.items():
+                if k in df.columns:
+                    df.at[idx, k] = v
 
-        df.at[idx, "interpretation"] = infer_physical_interpretation(row, feature_summaries)
+        # -------------------------
+        # Store top-feature details
+        # -------------------------
+        for i, item in enumerate(feature_summaries, start=1):
+            df.at[idx, f"top_feature_{i}"] = item["feature"]
+            df.at[idx, f"top_anomaly_reason_{i}"] = build_reason_text(item)
+            df.at[idx, f"top_feature_{i}_robust_z"] = item["robust_z"]
+            df.at[idx, f"top_feature_{i}_robust_z_clipped"] = item["robust_z_clipped"]
+            df.at[idx, f"top_feature_{i}_delta"] = item["delta"]
+            df.at[idx, f"top_feature_{i}_relative_delta_score"] = item["relative_delta_score"]
+            df.at[idx, f"top_feature_{i}_ranking_score"] = item["ranking_score"]
+            df.at[idx, f"top_feature_{i}_normal_center"] = item["normal_center"]
+            df.at[idx, f"top_feature_{i}_family"] = item["family"]
+
+        # -------------------------
+        # Final interpretation
+        # -------------------------
+        df.at[idx, "interpretation"] = infer_physical_interpretation(
+            row=row,
+            feature_summaries=feature_summaries,
+            family_scores=family_scores,
+            diagnostics=diagnostics,
+        )
+
+    # Force numeric diagnostic columns back to numeric dtype
+    if add_diagnostics:
+        for col in numeric_diagnostic_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
     return df

@@ -13,6 +13,16 @@ from src.config import (
 
 
 def print_dataset_preview(df_feat: pd.DataFrame) -> None:
+    """Gibt eine kompakte textuelle Vorschau auf den Feature-Datensatz aus.
+
+    Angezeigt werden die ersten Zeilen, die vorhandenen Spaltennamen und die
+    Gesamtform des Datensatzes. Diese einfache Ausgabe ist oft der schnellste
+    Weg, um offensichtliche Probleme in Struktur, Groesse oder Benennung der
+    Features frueh zu erkennen.
+
+    Aufrufkontext:
+    Wird in `run_all_visual_checks` als erster Plausibilitaetsschritt aufgerufen.
+    """
     print("\nPreview of extracted dataset:\n")
     print(df_feat.head(20))
 
@@ -23,6 +33,16 @@ def print_dataset_preview(df_feat: pd.DataFrame) -> None:
 
 
 def plot_dt_distribution(df_feat: pd.DataFrame) -> None:
+    """Visualisiert die Verteilung der zeitlichen Abstaende zwischen Messpunkten.
+
+    Durch die Histogramm-Darstellung laesst sich schnell erkennen, ob die
+    Messfrequenz grob konstant ist oder ob es starke Ausreisser und
+    Unregelmaessigkeiten in der zeitlichen Abtastung gibt. Solche Auffaelligkeiten
+    wirken sich direkt auf Ableitungen und Rolling-Features aus.
+
+    Aufrufkontext:
+    Wird in `run_all_visual_checks` zur Kontrolle der Sampling-Struktur genutzt.
+    """
     plt.figure()
     plt.hist(df_feat["dt_s"].clip(upper=df_feat["dt_s"].quantile(0.99)), bins=60)
     plt.title("dt_s distribution (clipped at 99th percentile)")
@@ -34,8 +54,16 @@ def plot_dt_distribution(df_feat: pd.DataFrame) -> None:
 
 def plot_core_signals_over_time(df_feat: pd.DataFrame) -> None:
     """
-    Plot main physical signals over time:
-    current, voltage, SOC (context), and mean temperature.
+    Zeichnet die wichtigsten physikalischen Grundsignale ueber der Zeitachse.
+
+    Dazu gehoeren vor allem Strom, Spannung und falls vorhanden der SOC sowie
+    ausgewaehlte Temperaturmerkmale. Die Darstellung dient als grobe
+    Realitaetspruefung: Entwickler sehen damit schnell, ob Signalverlaeufe
+    plausibel aussehen oder ob Datenspruenge, Flatlines oder andere Artefakte
+    vorliegen.
+
+    Aufrufkontext:
+    Wird von `run_all_visual_checks` als grundlegende Sichtpruefung ausgefuehrt.
     """
     s = df_feat.iloc[::10]
     t = s[TS_COL]
@@ -77,8 +105,16 @@ def plot_core_signals_over_time(df_feat: pd.DataFrame) -> None:
 
 def plot_temperature_statistics_over_time(df_feat: pd.DataFrame) -> None:
     """
-    Plot engineered temperature statistics over time.
-    These should be physically meaningful and smooth.
+    Stellt zentrale temperaturbezogene Summary-Features ueber die Zeit dar.
+
+    Die Funktion dient dazu, aus den rohen Sensordaten abgeleitete Kenngroessen
+    wie Mittelwerte, Minima, Maxima, Spreizungen oder Standardabweichungen
+    zeitlich nachzuvollziehen. So kann geprueft werden, ob die konstruierten
+    thermischen Features weich, plausibel und physikalisch konsistent verlaufen.
+
+    Aufrufkontext:
+    Wird in `run_all_visual_checks` zur Validierung der thermischen Features
+    aufgerufen.
     """
     s = df_feat.iloc[::10]
     t = s[TS_COL]
@@ -107,8 +143,15 @@ def plot_temperature_statistics_over_time(df_feat: pd.DataFrame) -> None:
 
 def plot_temperature_feature_distributions(df_feat: pd.DataFrame) -> None:
     """
-    Histograms of the main engineered temperature features.
-    Helps check if values are realistic or broken.
+    Zeigt Verteilungen zentraler Temperatur-Features als Histogramme.
+
+    Damit kann geprueft werden, ob die erzeugten Features in realistischen
+    Wertebereichen liegen oder ob einzelne Berechnungen zu unplausiblen
+    Auspraegungen fuehren. Gerade fuer neue oder geaenderte Feature-Definitionen
+    ist diese Sicht sehr hilfreich.
+
+    Aufrufkontext:
+    Wird in `run_all_visual_checks` als statistische Sichtpruefung verwendet.
     """
     plt.figure()
     plt.hist(df_feat["temp_mean_C"].dropna(), bins=80)
@@ -137,8 +180,16 @@ def plot_temperature_feature_distributions(df_feat: pd.DataFrame) -> None:
 
 def plot_temperature_dynamics(df_feat: pd.DataFrame) -> None:
     """
-    Plot temperature derivative features over time.
-    Useful to see whether dT/dt behaves sensibly.
+    Visualisiert temperaturbezogene Dynamik- und Aenderungsmerkmale.
+
+    Diese Darstellung hilft dabei zu verstehen, wie stark und wie schnell sich
+    thermische Groessen veraendern. Besonders bei transienten oder instabilen
+    Zustaenden kann man hier pruefen, ob die berechneten Ableitungen zur
+    beobachteten Zeitreihe passen.
+
+    Aufrufkontext:
+    Wird in `run_all_visual_checks` fuer die Kontrolle der Dynamik-Features
+    genutzt.
     """
     s = df_feat.iloc[::10]
     t = s[TS_COL]
@@ -157,8 +208,15 @@ def plot_temperature_dynamics(df_feat: pd.DataFrame) -> None:
 
 def plot_voltage_spread_over_time(df_feat: pd.DataFrame) -> None:
     """
-    Plot cell voltage spread features over time.
-    Important for cell imbalance anomaly checks.
+    Zeichnet Merkmale zur Zellspannungs-Ungleichverteilung ueber die Zeit.
+
+    Weil die Spannungs-Spreizung ein wichtiges elektrisches Anomalie-Merkmal
+    ist, kann mit diesem Plot schnell geprueft werden, ob das Signal sauber
+    berechnet wurde und ob es zeitlich ein sinnvolles Verhalten zeigt.
+
+    Aufrufkontext:
+    Wird in `run_all_visual_checks` als spezieller Check fuer elektrische
+    Balance-Merkmale ausgefuehrt.
     """
     s = df_feat.iloc[::10]
     t = s[TS_COL]
@@ -178,8 +236,15 @@ def plot_voltage_spread_over_time(df_feat: pd.DataFrame) -> None:
 
 def plot_load_vs_temperature_relationships(df_feat: pd.DataFrame) -> None:
     """
-    Scatter plots to check whether thermal behavior correlates with load.
-    These are important sanity checks for anomaly features.
+    Vergleicht Lastgroessen und Temperaturmerkmale in Scatter-Plots.
+
+    Ziel ist zu erkennen, ob thermische Muster in einer plausiblen Beziehung zur
+    Stroembelastung stehen. Wenn Temperaturspreizung oder Temperaturdynamik
+    ueberhaupt keinen nachvollziehbaren Zusammenhang zur Last zeigen, ist das
+    oft ein Hinweis auf fehlerhafte Feature-Bildung oder Datenqualitaetsprobleme.
+
+    Aufrufkontext:
+    Wird in `run_all_visual_checks` als fachlicher Plausibilitaetscheck genutzt.
     """
     sample = df_feat.sample(n=min(5000, len(df_feat)), random_state=0)
 
@@ -219,8 +284,16 @@ def plot_load_vs_temperature_relationships(df_feat: pd.DataFrame) -> None:
 
 def plot_rolling_feature_checks(df_feat: pd.DataFrame) -> None:
     """
-    Plot rolling features to confirm they behave like smoothed versions
-    of the raw features.
+    Vergleicht Rolling-Features direkt mit ihren zugrunde liegenden Rohsignalen.
+
+    Damit laesst sich ueberpruefen, ob die geglaetteten oder ueber Zeitfenster
+    aggregierten Merkmale wirklich wie erwartet aus den Rohwerten hervorgehen.
+    Entwickler sehen dadurch schnell, ob Fensterlaenge, Sampling oder
+    Indexierung korrekt funktionieren.
+
+    Aufrufkontext:
+    Wird in `run_all_visual_checks` zur Kontrolle der Zeitfenster-Logik
+    ausgefuehrt.
     """
     s = df_feat.iloc[::10]
     t = s[TS_COL]
@@ -261,9 +334,16 @@ def plot_rolling_feature_checks(df_feat: pd.DataFrame) -> None:
 
 def plot_rest_points(df_feat: pd.DataFrame) -> None:
     """
-    Keep this only as a context check.
-    Rest points can be useful to understand whether low-current behavior
-    is physically reasonable.
+    Betrachte nur Messpunkte im Ruhemodus als separaten Kontext-Check.
+
+    Ruhepunkte verhalten sich physikalisch oft anders als Punkte unter Last.
+    Deshalb erlaubt diese Visualisierung eine gezielte Sicht auf Spannungs- und
+    Temperaturverhalten bei sehr kleinem Strom. Das hilft bei der Einordnung,
+    ob Features fuer Restphasen plausibel wirken.
+
+    Aufrufkontext:
+    Wird in `run_all_visual_checks` als zusaetzlicher Spezialfall-Check
+    ausgefuehrt.
     """
     rest = df_feat[df_feat["is_rest"] == 1]
 
@@ -283,7 +363,16 @@ def plot_rest_points(df_feat: pd.DataFrame) -> None:
 
 def plot_power_redundancy(df_feat: pd.DataFrame) -> None:
     """
-    Keep this while validating whether POWER_COL should remain in the pipeline.
+    Prueft, wie stark sich die vorhandene Leistungs-Spalte von `V * I` unterscheidet.
+
+    Wenn die gelieferte Leistung praktisch nur eine direkte Ableitung aus Strom
+    und Spannung ist, bringt sie moeglicherweise wenig zusaetzliche Information
+    fuer das Modell. Die Verteilung des Fehlers zwischen gemessener Leistung und
+    einfacher Approximation macht diesen Zusammenhang sichtbar.
+
+    Aufrufkontext:
+    Wird in `run_all_visual_checks` genutzt, solange bewertet wird, ob die
+    Leistungs-Spalte im Feature-Set bleiben soll.
     """
     if POWER_COL in df_feat.columns and df_feat[POWER_COL].notna().any():
         approx = df_feat[VOLTAGE_COL] * df_feat[CURRENT_COL]
@@ -303,7 +392,15 @@ def plot_power_redundancy(df_feat: pd.DataFrame) -> None:
 
 def run_all_visual_checks(df_feat: pd.DataFrame) -> None:
     """
-    Run all anomaly-feature sanity checks.
+    Fuehrt die komplette Sammlung aller Visualisierungs-Checks nacheinander aus.
+
+    Diese Funktion ist die zentrale Sammelstelle fuer die manuelle Sichtpruefung
+    des Feature-Datensatzes. Sie ruft sowohl einfache Uebersichtsplots als auch
+    spezifischere diagnostische Grafiken fuer Temperatur-, Spannungs- und
+    Rolling-Merkmale auf.
+
+    Aufrufkontext:
+    Wird direkt von `src.main.visualize` gestartet.
     """
     print_dataset_preview(df_feat)
     plot_dt_distribution(df_feat)
@@ -320,9 +417,16 @@ def run_all_visual_checks(df_feat: pd.DataFrame) -> None:
 
 def plot_anomalies(df: pd.DataFrame, feature: str) -> None:
     """
-    Plot a feature over time with anomalies highlighted.
-    Normal points = blue
-    Anomalies = red
+    Zeichnet ein einzelnes Feature ueber die Zeit und hebt Anomalien farblich hervor.
+
+    Normale Punkte und anomale Punkte werden getrennt dargestellt, damit
+    Entwickler schnell sehen koennen, an welchen Zeitpunkten das Modell
+    Auffaelligkeiten markiert hat und wie diese Punkte im Werteverlauf des
+    ausgewaehlten Features liegen.
+
+    Aufrufkontext:
+    Kann aus `src.main.detect_anomalies` genutzt werden, wenn der optionale
+    Plot-Block aktiviert wird.
     """
 
     if "anomaly" not in df.columns:

@@ -13,6 +13,17 @@ from src.config import (
 
 
 def read_varta_blm_csv(path: Path) -> pd.DataFrame:
+    """Laedt eine einzelne rohe Varta-BLM-CSV im erwarteten Exportformat.
+
+    Die Funktion beruecksichtigt dabei die projektspezifische CSV-Struktur mit
+    Kopfzeilenversatz, Semikolon-Trennung und Komma als Dezimaltrennzeichen.
+    Danach werden die Spaltennamen bereinigt und der Name der Quelldatei in
+    einer eigenen Spalte gespeichert, damit spaeter nachvollziehbar bleibt, aus
+    welcher Datei eine Zeile stammt.
+
+    Aufrufkontext:
+    Diese Funktion wird von `load_all_csvs` pro gefundener Datei aufgerufen.
+    """
     df = pd.read_csv(
         path,
         skiprows=6,
@@ -22,12 +33,27 @@ def read_varta_blm_csv(path: Path) -> pd.DataFrame:
         on_bad_lines="skip",
     )
 
-    df = df.rename(columns=lambda c: c.lstrip("# ").strip())
-    df = df.assign(__source_file=path.name).copy()
+    df = df.rename(columns=lambda c: c.lstrip("# ").strip()).copy()
+
+    # Add the source filename in one concat step to avoid DataFrame fragmentation
+    # warnings on wide CSV exports.
+    source_col = pd.Series(path.name, index=df.index, name="__source_file")
+    df = pd.concat([df, source_col], axis=1, copy=False)
     return df
 
 
 def load_all_csvs(data_dir: Path) -> pd.DataFrame:
+    """Laedt alle Rohdaten-CSV-Dateien aus einem Verzeichnis und fuegt sie zusammen.
+
+    Jede Datei wird einzeln ueber `read_varta_blm_csv` eingelesen. Erfolgreich
+    geladene Dateien werden gesammelt, fehlerhafte Dateien nur protokolliert,
+    damit der Gesamtlauf moeglichst robust bleibt. Am Ende werden alle gueltigen
+    Teil-DataFrames untereinander konkateniert und als gemeinsamer Rohdatensatz
+    zurueckgegeben.
+
+    Aufrufkontext:
+    Dies ist der erste Datenlade-Schritt in `src.main.extract`.
+    """
     files = sorted(data_dir.glob(CSV_GLOB))
     if not files:
         raise FileNotFoundError(f"No CSV files found in {data_dir}")
@@ -57,12 +83,24 @@ def load_all_csvs(data_dir: Path) -> pd.DataFrame:
 
 
 def save_feature_table(df: pd.DataFrame, out_dir: Path) -> Path:
+    """Speichert die aufbereiteten Feature-Daten als verarbeitete CSV-Datei.
+
+    Die Funktion schreibt den uebergebenen DataFrame mit den projektspezifischen
+    CSV-Einstellungen in das Zielverzeichnis und gibt den finalen Dateipfad
+    zurueck. Damit steht die Datei spaeter fuer Visualisierung,
+    Anomalieerkennung oder Archivierung konsistent zur Verfuegung.
+
+    Aufrufkontext:
+    Wird in `src.main.extract` nach Abschluss von `build_feature_table`
+    aufgerufen.
+    """
     out_csv = out_dir / FEATURE_OUTPUT_FILENAME
     df.to_csv(
         out_csv,
         index=False,
         sep=";",
         decimal=",",
+        encoding="utf-8-sig"
         
     )
     print("Saved extracted dataset to:", out_csv)
@@ -70,6 +108,16 @@ def save_feature_table(df: pd.DataFrame, out_dir: Path) -> Path:
 
 
 def load_feature_table(out_dir: Path) -> pd.DataFrame:
+    """Laedt die bereits erzeugte Feature-Tabelle wieder aus dem Dateisystem.
+
+    Zusaetzlich wird die Timestamp-Spalte, falls vorhanden, erneut in ein
+    Datumsformat ueberfuehrt. Die Funktion bildet damit die standardisierte
+    Lade-Schnittstelle fuer alle Pipeline-Schritte, die nicht mit Rohdaten,
+    sondern mit bereits verarbeiteten Features arbeiten.
+
+    Aufrufkontext:
+    Wird von `src.main.visualize` und `src.main.detect_anomalies` verwendet.
+    """
     feature_path = out_dir / FEATURE_OUTPUT_FILENAME
     if not feature_path.exists():
         raise FileNotFoundError(
@@ -93,6 +141,18 @@ def save_anomaly_tables(
     df_top20: pd.DataFrame,
     out_dir: Path,
 ) -> tuple[Path, Path, Path]:
+    """Schreibt die drei zentralen Ergebnisdateien der Anomalieerkennung auf Disk.
+
+    Gespeichert werden der komplette bewertete Datensatz, die reine
+    Anomalie-Teilmenge sowie eine kompakte Top-N-Auswahl der auffaelligsten
+    Faelle. Alle Dateien werden mit einheitlichem CSV-Format geschrieben, damit
+    sie spaeter unkompliziert weiterverwendet, verglichen oder archiviert werden
+    koennen.
+
+    Aufrufkontext:
+    Die Funktion wird in `src.main.detect_anomalies` nach Modellbewertung und
+    Erklaerungsanreicherung ausgefuehrt.
+    """
     all_path = out_dir / ANOMALY_ALL_OUTPUT_FILENAME
     only_path = out_dir / ANOMALY_ONLY_OUTPUT_FILENAME
     top20_path = out_dir / ANOMALY_TOP20_OUTPUT_FILENAME
@@ -107,6 +167,7 @@ def save_anomaly_tables(
             index=False,
             sep=";",
             decimal=",",
+            encoding="utf-8-sig"
         )
 
     print("Saved all anomaly results to:", all_path)
@@ -117,6 +178,17 @@ def save_anomaly_tables(
 
 
 def load_anomaly_table(path: Path) -> pd.DataFrame:
+    """Laedt eine zuvor gespeicherte Ergebnisdatei der Anomalieerkennung.
+
+    Diese Hilfsfunktion ist fuer spaetere Analyse-, Notebook- oder
+    Visualisierungszwecke gedacht. Falls die Timestamp-Spalte vorhanden ist,
+    wird sie beim Einlesen direkt in ein Datumsformat konvertiert, damit der
+    Datensatz ohne weitere Vorbereitung weiterverarbeitet werden kann.
+
+    Aufrufkontext:
+    Gedacht als allgemeine Hilfsfunktion fuer nachgelagerte Auswertungen auf den
+    von `save_anomaly_tables` erzeugten Dateien.
+    """
     if not path.exists():
         raise FileNotFoundError(f"Anomaly file not found: {path}")
 
