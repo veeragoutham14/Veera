@@ -5,18 +5,84 @@ from src.config import (
     X_RAW,
     CURRENT_COL,
     VOLTAGE_COL,
-    SOH_COL,
     TIMESTAMP_FORMAT,
     TEMP_SENSOR_COLS,
     VOLTAGE_SPREAD_FEATURES,
+    PACK_TEMP_GROUPS,
+    MODULE_PACK_GROUPS,
 )
+
+
+MIN_VALID_TEMP_SENSORS_PER_PACK = 4
+MIN_REQUIRED_MODULES = 1
+
+
+def get_complete_pack_groups(columns: pd.Index | list[str]) -> dict[str, list[str]]:
+    """
+    Ermittelt alle Pack-Gruppen, deren Temperatursensoren im Datensatz vollstaendig vorhanden sind.
+
+    Ein Pack gilt hier nur dann als verfuegbar, wenn alle erwarteten
+    Temperatursensor-Spalten im geladenen Datensatz existieren. Dadurch kann die
+    Pipeline unterschiedliche Hardware-Layouts robust verarbeiten, ohne fuer
+    nicht vorhandene Module oder Packs zu scheitern.
+    """
+    column_set = set(columns)
+    complete_packs = {}
+
+    for pack_name, sensor_cols in PACK_TEMP_GROUPS.items():
+        if all(col in column_set for col in sensor_cols):
+            complete_packs[pack_name] = sensor_cols
+
+    return complete_packs
+
+
+def get_complete_module_groups(complete_packs: dict[str, list[str]]) -> dict[str, list[str]]:
+    """
+    Ermittelt alle Module, fuer die beide definierten Packs vollstaendig vorhanden sind.
+
+    Ein Modul wird nur dann als verfuegbar betrachtet, wenn beide Pack-Namen aus
+    `MODULE_PACK_GROUPS` im Datensatz als vollstaendige Pack-Gruppen erkannt
+    wurden.
+    """
+    complete_modules = {}
+
+    for module_name, pack_names in MODULE_PACK_GROUPS.items():
+        if all(pack_name in complete_packs for pack_name in pack_names):
+            complete_modules[module_name] = pack_names
+
+    return complete_modules
 
 
 def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Keep only the columns needed for anomaly detection.
+    Beschraenkt den Rohdatensatz auf die fuer die Pipeline benoetigten Spalten.
+
+    Die Funktion baut aus Timestamp, definierten Rohmerkmalen und der
+    Quelldatei-Spalte die Soll-Liste auf und prueft gleichzeitig, ob etwas
+    Wesentliches fehlt. Fehlen Pflichtspalten, wird fruehzeitig ein klarer
+    Fehler geworfen. Sind alle Spalten vorhanden, wird ein sauberer Ausschnitt
+    des DataFrames zurueckgegeben.
+
+    Aufrufkontext:
+    Dies ist der erste Schritt in `prepare_base_dataframe`.
     """
-    need = [TS_COL] + X_RAW + ["__source_file"]
+    complete_packs = get_complete_pack_groups(df.columns)
+    complete_modules = get_complete_module_groups(complete_packs)
+
+    if len(complete_modules) < MIN_REQUIRED_MODULES:
+        raise ValueError(
+            "No supported battery module layout found in raw data.\n"
+            f"Detected complete packs: {sorted(complete_packs.keys())}\n"
+            "Need at least one full module with both packs present."
+        )
+
+    available_temp_cols = [
+        col
+        for pack_name in complete_packs
+        for col in PACK_TEMP_GROUPS[pack_name]
+    ]
+
+    need = [TS_COL] + X_RAW[: len(X_RAW) - len(TEMP_SENSOR_COLS)] + available_temp_cols + ["__source_file"]
     missing = [c for c in need if c not in df.columns]
 
     if missing:
@@ -27,7 +93,16 @@ def select_required_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def parse_and_sort_timestamp(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Parse timestamp and sort chronologically.
+    Wandelt die Timestamp-Spalte in echte Zeitwerte um und sortiert chronologisch.
+
+    Ungueltige Zeitstempel werden verworfen, damit nachfolgende Schritte nur mit
+    konsistenten Zeitreihen arbeiten. Durch die Sortierung ist sichergestellt,
+    dass Differenzen, Rolling-Windows und andere zeitbezogene Berechnungen auf
+    der richtigen Reihenfolge basieren.
+
+    Aufrufkontext:
+    Wird in `prepare_base_dataframe` vor allen zeitbasierten Berechnungen
+    ausgefuehrt.
     """
     df[TS_COL] = pd.to_datetime(
         df[TS_COL],
@@ -40,8 +115,15 @@ def parse_and_sort_timestamp(df: pd.DataFrame) -> pd.DataFrame:
 
 def get_numeric_columns() -> list[str]:
     """
-    Build a list of columns that should be converted to numeric.
-    Excludes categorical/state columns like batteryState, stackStatus, etc.
+    Liefert die Menge der Rohspalten, die numerisch interpretiert werden muessen.
+
+    Dazu gehoeren insbesondere Temperatursensoren, Spannungs-Spreizungsinputs
+    sowie die zentralen elektrischen Signale. Die Funktion enthaelt die
+    Definition an einer Stelle, damit die eigentliche Typkonvertierung spaeter
+    nicht mehrere verteilte Listen pflegen muss.
+
+    Aufrufkontext:
+    Interne Hilfsfunktion fuer `convert_numeric_columns`.
     """
     numeric_cols = (
         TEMP_SENSOR_COLS
@@ -49,11 +131,9 @@ def get_numeric_columns() -> list[str]:
         + [
             CURRENT_COL,
             VOLTAGE_COL,
-            SOH_COL,
         ]
     )
 
-    # keep only unique values while preserving order
     seen = set()
     unique_numeric_cols = []
     for col in numeric_cols:
@@ -66,7 +146,15 @@ def get_numeric_columns() -> list[str]:
 
 def convert_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert all anomaly-relevant numeric columns to numeric dtype.
+    Konvertiert alle relevanten Rohsignalspalten in numerische Werte.
+
+    Nicht interpretierbare Eintraege werden dabei bewusst zu `NaN`, damit sie in
+    spaeteren Validierungs- oder Filter-Schritten sauber erkannt werden koennen.
+    So wird verhindert, dass fehlerhafte String- oder Mischformate unbemerkt in
+    die Feature-Berechnung gelangen.
+
+    Aufrufkontext:
+    Wird in `prepare_base_dataframe` nach der Spaltenauswahl ausgefuehrt.
     """
     numeric_cols = get_numeric_columns()
 
@@ -77,31 +165,82 @@ def convert_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def get_sufficient_pack_temperature_mask(
+    df: pd.DataFrame,
+    pack_groups: dict[str, list[str]],
+) -> pd.Series:
+    """
+    Prueft fuer alle Zeilen gleichzeitig, ob jedes verfuegbare Pack genug gueltige Temperatursensoren hat.
+
+    Die Logik entspricht der bisherigen zeilenweisen Pruefung: Fuer jedes Pack
+    wird pro Zeile gezaehlt, wie viele Sensorwerte nicht fehlen. Eine Zeile
+    bleibt nur dann erhalten, wenn in jedem beruecksichtigten Pack mindestens
+    `MIN_VALID_TEMP_SENSORS_PER_PACK` gueltige Werte vorhanden sind.
+
+    Die Umsetzung ist bewusst vektorisiert, damit auch sehr grosse Datensaetze
+    performant verarbeitet werden koennen.
+    """
+    mask = pd.Series(True, index=df.index)
+
+    for cols in pack_groups.values():
+        pack_valid_mask = df[cols].notna().sum(axis=1) >= MIN_VALID_TEMP_SENSORS_PER_PACK
+        mask &= pack_valid_mask
+
+    return mask
+
+
 def drop_rows_missing_core_signals(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Drop rows missing the minimum critical signals needed for anomaly detection.
+    Entfernt alle Zeilen, die fuer verlaessliches Feature Engineering ungeeignet sind.
 
-    For temperature anomaly detection, the truly critical signals are:
-    - current
-    - voltage
-    - SOH
-    - at least the temperature sensors
+    Zunaechst werden Zeilen ohne zentrale elektrische Signale verworfen.
+    Anschliessend werden Zeilen ohne die benoetigten Spannungs-Spreizungsinputs
+    ausgeschlossen. Zum Schluss wird ueber `has_sufficient_pack_temperature`
+    sichergestellt, dass auch die Temperaturabdeckung pro Pack hoch genug ist.
+    Das Ergebnis ist ein deutlich robusterer Eingabedatensatz fuer die
+    nachfolgenden Engineering-Schritte.
+
+    Aufrufkontext:
+    Wird in `prepare_base_dataframe` nach der numerischen Typkonvertierung
+    ausgefuehrt.
     """
-    core = [CURRENT_COL, VOLTAGE_COL, SOH_COL]
+    pack_groups = get_complete_pack_groups(df.columns)
+    module_groups = get_complete_module_groups(pack_groups)
 
-    # require all main core context signals
+    if len(module_groups) < MIN_REQUIRED_MODULES:
+        raise ValueError(
+            "No supported battery module layout remains after column selection.\n"
+            f"Detected complete packs: {sorted(pack_groups.keys())}\n"
+            "Need at least one full module with both packs present."
+        )
+
+    # Only keep what actually matters
+    core = [CURRENT_COL, VOLTAGE_COL]
+
     df = df.dropna(subset=core).reset_index(drop=True)
 
-    # require at least one valid temperature sensor row
-    temp_available_mask = df[TEMP_SENSOR_COLS].notna().any(axis=1)
-    df = df[temp_available_mask].reset_index(drop=True)
+    # Require voltage spread inputs
+    df = df.dropna(subset=VOLTAGE_SPREAD_FEATURES).reset_index(drop=True)
+
+    # Require proper temperature coverage (pack-aware)
+    mask = get_sufficient_pack_temperature_mask(df, pack_groups=pack_groups)
+    df = df[mask].reset_index(drop=True)
 
     return df
 
 
 def prepare_base_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Run all basic preprocessing steps for anomaly detection.
+    Fuehrt die komplette Vorverarbeitung fuer den zusammengefuehrten Rohdatensatz aus.
+
+    Diese Funktion kapselt die einzelnen Preprocessing-Schritte in der richtigen
+    Reihenfolge: Pflichtspalten auswaehlen, Zeitstempel parsen, numerische
+    Konvertierung durchfuehren und unbrauchbare Zeilen entfernen. Das Ergebnis
+    ist die stabile Ausgangsbasis fuer das gesamte nachfolgende Feature
+    Engineering.
+
+    Aufrufkontext:
+    Wird in `src.main.extract` unmittelbar vor `build_feature_table` aufgerufen.
     """
     df = select_required_columns(df)
     df = parse_and_sort_timestamp(df)

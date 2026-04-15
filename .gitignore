@@ -11,6 +11,9 @@ __pycache__/
 
 # Generated outputs
 data/processed/
+data/models/
+data/Excel_view/
+run_archive/
 
 # Raw datasets / logs
 

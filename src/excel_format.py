@@ -8,7 +8,17 @@ EXCEL_DIR = Path(r"C:\Users\GouthamVeera\Documents\Veera\data\Excel_view")
 
 def get_smallest_csv(csv_files: list[Path]) -> list[Path]:
     """
-    Return a list containing only the smallest CSV file.
+    Waehlt aus einer Liste von CSV-Dateien die kleinste Datei aus.
+
+    Das ist nuetzlich, wenn fuer eine schnelle Sichtpruefung oder einen ersten
+    Excel-Export nicht alle Dateien verarbeitet werden sollen. Statt eine
+    einzelne `Path`-Instanz zurueckzugeben, liefert die Funktion bewusst wieder
+    eine Liste, damit der weitere Verarbeitungsfluss in `export_csvs_to_excel`
+    unveraendert bleiben kann.
+
+    Aufrufkontext:
+    Wird in `export_csvs_to_excel` verwendet, wenn der Modus `smallest`
+    gewaehlt wurde.
     """
     smallest = min(csv_files, key=lambda f: f.stat().st_size)
     print(f"Selected smallest file: {smallest.name} ({smallest.stat().st_size / 1e6:.2f} MB)")
@@ -21,7 +31,17 @@ def export_csvs_to_excel(
     mode: str = "all",  # "all" or "smallest"
 ) -> None:
     """
-    Convert CSV files in input_dir to Excel.
+    Konvertiert CSV-Ergebnisdateien in Excel-Dateien fuer die manuelle Analyse.
+
+    Die Funktion durchsucht ein Eingabeverzeichnis nach CSV-Dateien, entscheidet
+    je nach Modus, ob alle oder nur die kleinste Datei verarbeitet werden soll,
+    und schreibt anschliessend fuer jede geladene CSV eine `.xlsx`-Datei in das
+    Zielverzeichnis. Fehler beim Einlesen oder Schreiben einzelner Dateien werden
+    protokolliert, damit ein Problem nicht den gesamten Exportlauf abbricht.
+
+    Aufrufkontext:
+    Diese Funktion wird ueber den Script-Block am Ende der Datei ausgefuehrt und
+    ist nicht Bestandteil des normalen Haupt-Pipelineschritts in `src.main`.
 
     mode:
         - "all" → export all CSVs
